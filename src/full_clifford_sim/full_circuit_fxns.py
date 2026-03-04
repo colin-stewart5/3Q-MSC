@@ -147,7 +147,7 @@ class FullCircuit:
         return measCircuit
     
     
-    def cbasis_check(self) -> stim.Circuit:
+    def cbasis_check(self, incl_idles=True) -> stim.Circuit:
         "does a transvesral check using the GHZ state"
 
         if self.basis not in ["Y"]:
@@ -175,6 +175,7 @@ class FullCircuit:
         elif self.glen==3:
             cy_step1 = [gqs[0], mqs[0], gqs[1], mqs[5], gqs[2], mqs[8]]
             check_circ.append("CY", cy_step1)
+            if incl_idles: check_circ.append("I", aqs)
             check_circ.append("TICK")
 
             cy_step2 = [gqs[0], mqs[3], gqs[1], mqs[6], gqs[2], mqs[7]]

@@ -334,8 +334,21 @@ class GidneyNoiseModel:
                     qubits_out.append(target.value)
 
         # Safety check for operation collisions.
-        usage_counts = collections.Counter(collapse_qubits + clifford_qubits)
-        qubits_used_multiple_times = {q for q, c in usage_counts.items() if c != 1}
+        #
+        # One special case is allowed: a qubit may be acted on once and then
+        # measured/reset in the same moment. The GHZ-5 flag circuit uses this
+        # sequential pattern, and it should not be treated like two competing
+        # quantum gates scheduled on the same wire.
+        collapse_counts = collections.Counter(collapse_qubits)
+        clifford_counts = collections.Counter(clifford_qubits)
+        qubits_used_multiple_times = set()
+        for q in set(collapse_counts) | set(clifford_counts):
+            c = collapse_counts[q]
+            k = clifford_counts[q]
+            if c > 1 or k > 1:
+                qubits_used_multiple_times.add(q)
+            elif c + k > 1 and not (c == 1 and k == 1):
+                qubits_used_multiple_times.add(q)
         if qubits_used_multiple_times:
             moment = stim.Circuit()
             for op in moment_split_ops:

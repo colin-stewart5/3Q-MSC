@@ -119,7 +119,7 @@ class CompiledPymatchingGapSampler(sinter.CompiledSampler):
         
         num_shots = dets.shape[0]
         discard_mask = np.any(dets & self.postselection_mask, axis=1)
-        num_discards = np.count_nonzero(discard_mask)
+        num_discards = int(np.count_nonzero(discard_mask))
         dets = dets[~discard_mask]
         actual_obs = actual_obs[~discard_mask]
         num_kept_shots = dets.shape[0]
@@ -150,7 +150,7 @@ class CompiledPymatchingGapSampler(sinter.CompiledSampler):
             errors = np.abs(predictions.astype(np.int16))
         sorted_weights = np.sort(weights, axis=1)
         gaps = (sorted_weights[:, 1] - sorted_weights[:, 0])
-        num_errors = np.count_nonzero(errors)
+        num_errors = int(np.count_nonzero(errors))
 
         # Classify all shots by their error + gap.
         custom_counts = collections.Counter()
@@ -164,10 +164,10 @@ class CompiledPymatchingGapSampler(sinter.CompiledSampler):
         t1 = time.monotonic()
 
         return sinter.AnonTaskStats(
-            shots=num_shots,
+            shots=int(num_shots),
             errors=num_errors,
             discards=num_discards,
-            seconds=t1 - t0,
+            seconds=float(t1 - t0),
             custom_counts=custom_counts,
         )
 

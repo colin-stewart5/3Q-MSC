@@ -18,9 +18,199 @@ from full_clifford_sim.cirq_utilities import *
 ## take DEM from ref_circuit, and decode shots from sample circutis
 
 
+USE_CUSTOM_CCZ = True
+CUSTOM_CCZ_LABEL = "rydberg_ccz_pulse2"
+
+# Paste your 8x8 CCZ-like matrix here. Leave as None to keep the ideal Cirq CCZ.
+CUSTOM_CCZ_MATRIX = np.array(
+    [
+        [-0.978934 - 0.204178j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j],
+        [0.0 + 0.0j, -0.978983 - 0.203944j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j],
+        [0.0 + 0.0j, 0.0 + 0.0j, -0.978977 - 0.20397j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j],
+        [0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, -0.978787 - 0.204875j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j],
+        [0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, -0.978964 - 0.204035j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j],
+        [0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, -0.978773 - 0.20494j, 0.0 + 0.0j, 0.0 + 0.0j],
+        [0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, -0.978768 - 0.204966j, 0.0 + 0.0j],
+        [0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.979054 + 0.203443j],
+    ],
+    dtype=np.complex128,
+)
+
+# Supported values:
+# - "unitary": require CUSTOM_CCZ_MATRIX to be unitary and use cirq.Simulator.
+# - "contractive_kraus": treat CUSTOM_CCZ_MATRIX as a 3-qubit Kraus operator K,
+#   automatically completing the channel with sqrt(I - K^\dagger K). This
+#   requires K^\dagger K <= I and uses cirq.DensityMatrixSimulator.
+# - "auto": use "unitary" if possible, otherwise try "contractive_kraus".
+#
+# Non-unitary CCZ support is wired in here already. To force the non-unitary
+# path for a physical gate model:
+# 1. Set CUSTOM_CCZ_MODE = "contractive_kraus".
+# 2. Put the measured 8x8 operator into CUSTOM_CCZ_MATRIX.
+# 3. Ensure it is contractive: K^\dagger K <= I up to
+#    CUSTOM_CCZ_CONTRACTIVE_ATOL, otherwise the script will reject it.
+# 4. The exact-simulation stage below will then switch to
+#    cirq.DensityMatrixSimulator automatically.
+#
+# Caveat: only the Cirq exact-sim prefix uses the non-unitary gate directly.
+# The later Stim/sinter resampling stage still operates on the stabilizerized
+# errored circuits keyed by the exact-sim outputs; Stim itself is not carrying
+# the non-unitary CCZ channel.
+CUSTOM_CCZ_MODE = "auto"
+CUSTOM_CCZ_CONTRACTIVE_ATOL = 1e-6
+CUSTOM_CCZ_NEAR_UNITARY_ATOL = 1e-4
+
+
+def _slugify(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+
+
+def current_ccz_label() -> str:
+    if USE_CUSTOM_CCZ:
+        return CUSTOM_CCZ_LABEL
+    return "ideal"
+
+
+def _as_8x8_complex_matrix(raw_matrix) -> np.ndarray | None:
+    if raw_matrix is None:
+        return None
+    matrix = np.asarray(raw_matrix, dtype=np.complex128)
+    if matrix.shape != (8, 8):
+        raise ValueError(f"Expected an 8x8 custom CCZ matrix, got {matrix.shape}.")
+    return matrix
+
+
+def _is_unitary(matrix: np.ndarray, atol: float = 1e-8) -> bool:
+    return np.allclose(matrix.conj().T @ matrix, np.eye(matrix.shape[0]), atol=atol)
+
+
+def _nearest_unitary(matrix: np.ndarray) -> np.ndarray:
+    u, _, vh = np.linalg.svd(matrix)
+    return u @ vh
+
+
+def _completed_kraus_ops_from_matrix(matrix: np.ndarray, atol: float = CUSTOM_CCZ_CONTRACTIVE_ATOL) -> tuple[np.ndarray, np.ndarray]:
+    residual = np.eye(matrix.shape[0], dtype=np.complex128) - matrix.conj().T @ matrix
+    residual = 0.5 * (residual + residual.conj().T)
+    evals, evecs = np.linalg.eigh(residual)
+    if np.min(evals) < -atol:
+        raise ValueError(
+            "CUSTOM_CCZ_MATRIX is not unitary and also cannot be treated as a single "
+            "Kraus operator because I - K^dagger K is not positive semidefinite."
+        )
+    evals = np.clip(evals, 0.0, None)
+    completion = evecs @ np.diag(np.sqrt(evals)) @ evecs.conj().T
+    return matrix, completion
+
+
+class ContractiveCustomCCZGate(cirq.Gate):
+    def __init__(self, matrix: np.ndarray):
+        self.matrix = _as_8x8_complex_matrix(matrix)
+        self._kraus_ops = _completed_kraus_ops_from_matrix(self.matrix)
+
+    def _num_qubits_(self) -> int:
+        return 3
+
+    def _kraus_(self):
+        return self._kraus_ops
+
+    def _circuit_diagram_info_(self, args):
+        return ("CCZ*", "CCZ*", "CCZ*")
+
+
+def build_ccz_factory() -> tuple[Callable[[cirq.Qid, cirq.Qid, cirq.Qid], cirq.Operation], bool]:
+    if not USE_CUSTOM_CCZ:
+        return lambda q0, q1, q2: cirq.CCZ(q0, q1, q2), False
+
+    matrix = _as_8x8_complex_matrix(CUSTOM_CCZ_MATRIX)
+    if matrix is None:
+        raise ValueError("USE_CUSTOM_CCZ=True but CUSTOM_CCZ_MATRIX is None.")
+
+    mode = CUSTOM_CCZ_MODE.lower()
+    if mode not in {"auto", "unitary", "contractive_kraus"}:
+        raise ValueError(f"Unsupported CUSTOM_CCZ_MODE={CUSTOM_CCZ_MODE!r}.")
+
+    if mode in {"auto", "unitary"}:
+        if _is_unitary(matrix):
+            gate = cirq.MatrixGate(matrix)
+            return lambda q0, q1, q2: gate.on(q0, q1, q2), False
+
+        # Option 1: treat the supplied gate as a coherent near-unitary pulse
+        # and project it onto the closest exact unitary so the exact-sim stage
+        # can stay on the statevector simulator.
+        if _is_unitary(matrix, atol=CUSTOM_CCZ_NEAR_UNITARY_ATOL):
+            projected = _nearest_unitary(matrix)
+            gate = cirq.MatrixGate(projected)
+            return lambda q0, q1, q2: gate.on(q0, q1, q2), False
+
+    if mode == "unitary":
+        raise ValueError(
+            "CUSTOM_CCZ_MODE='unitary' requires a unitary or near-unitary 8x8 matrix. "
+            "For leakage-like behavior, switch to 'contractive_kraus' or 'auto'."
+        )
+
+    # Non-unitary path: represent the supplied 8x8 matrix as a Kraus operator
+    # and complete it into a trace-preserving channel. Returning True here is
+    # what tells the caller to use DensityMatrixSimulator instead of the
+    # statevector simulator.
+    gate = ContractiveCustomCCZGate(matrix)
+    return lambda q0, q1, q2: gate.on(q0, q1, q2), True
+
+
+def _get_final_density_matrix(sim_result) -> np.ndarray:
+    if hasattr(sim_result, "final_density_matrix"):
+        return np.asarray(sim_result.final_density_matrix, dtype=np.complex128)
+
+    density_matrix_method = getattr(sim_result, "density_matrix", None)
+    if callable(density_matrix_method):
+        try:
+            return np.asarray(density_matrix_method(copy=False), dtype=np.complex128)
+        except TypeError:
+            return np.asarray(density_matrix_method(), dtype=np.complex128)
+
+    raise TypeError("Could not extract a final density matrix from the Cirq simulation result.")
+
+
+def _single_qubit_density_matrix(full_density_matrix: np.ndarray, qubit_index: int, num_qubits: int) -> np.ndarray:
+    dm_tensor = full_density_matrix.reshape((2,) * (2 * num_qubits))
+    current_qubits = num_qubits
+    current_index = qubit_index
+
+    for axis in range(num_qubits - 1, -1, -1):
+        if axis == qubit_index:
+            continue
+        dm_tensor = np.trace(dm_tensor, axis1=axis, axis2=axis + current_qubits)
+        if axis < current_index:
+            current_index -= 1
+        current_qubits -= 1
+
+    return dm_tensor.reshape((2, 2))
+
+
+def _bloch_vector_from_density_matrix(full_density_matrix: np.ndarray, qubit_index: int, num_qubits: int) -> np.ndarray:
+    rho = _single_qubit_density_matrix(full_density_matrix, qubit_index, num_qubits)
+    return np.array(
+        [
+            2 * np.real(rho[0, 1]),
+            -2 * np.imag(rho[0, 1]),
+            np.real(rho[0, 0] - rho[1, 1]),
+        ],
+        dtype=np.float64,
+    )
+
+
+def logical_bloch_vector(sim_result, logical_qubit: cirq.Qid, qubit_order: tuple[cirq.Qid, ...], use_density_sim: bool) -> np.ndarray:
+    if not use_density_sim:
+        return np.asarray(sim_result.bloch_vector_of(qubit=logical_qubit), dtype=np.float64)
+
+    logical_index = qubit_order.index(logical_qubit)
+    final_density_matrix = _get_final_density_matrix(sim_result)
+    return _bloch_vector_from_density_matrix(final_density_matrix, logical_index, len(qubit_order))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run one handoff shard for the HXY exact-simulation workflow."
+        description="Run one handoff shard for the HXY workflow with a custom CCZ gate."
     )
     parser.add_argument("p_milli", type=int, help="Physical error rate in units of 1e-3.")
     parser.add_argument("tasknum", type=int, help="Shard / seed identifier.")
@@ -46,13 +236,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-shots-per-sverr",
         type=int,
-        default=20,
+        default=int(os.environ.get("NUM_SHOTS_PER_SVERR", "20")),
         help="Number of Clifford shots sampled per statevector outcome.",
     )
     parser.add_argument(
         "--num-sverr-shots",
         type=int,
-        default=10,
+        default=int(os.environ.get("NUM_SVERR_SHOTS", "10")),
         help="Number of statevector samples taken before Clifford resampling.",
     )
     parser.add_argument(
@@ -67,6 +257,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional f-tag to add into the output metadata.",
     )
     return parser.parse_args()
+
 
 if __name__ == '__main__':
     args = parse_args()
@@ -89,6 +280,8 @@ if __name__ == '__main__':
     d2 = args.dfinal
     prep = args.prep
     latter_rounds = args.latter_rounds
+    ccz_label = current_ccz_label()
+    ccz_label_slug = _slugify(ccz_label)
 
     if prep == "unitstab":
         endofinj = 8
@@ -101,7 +294,7 @@ if __name__ == '__main__':
 
     x = datetime.datetime.now()
     tag = args.tag or x.strftime("%m%d")
-    path = './realcirqhandoffmid_p'+str(int(1000*p))+'_outs'+tag+'/'
+    path = f'./realcirqhandoffmid_{ccz_label_slug}_p{int(1000*p)}_outs{tag}/'
         
     #create a reference circuit used for matching
     ref_circuit = full_circuit(nm=p, 
@@ -123,6 +316,7 @@ if __name__ == '__main__':
                             skip_gauge_fix=True,
                             add_check_noise=not magic)
     criq_rep = stimcirq.stim_circuit_to_cirq_circuit(remove_QCs(cc,p, reverse_Y=False))
+    ccz_factory, use_density_sim = build_ccz_factory()
 
     if magic: #break down circuit 
 
@@ -151,9 +345,9 @@ if __name__ == '__main__':
                         ghzqub1 = op.qubits[0].x
 
                         if cy_moments % 3 == 0: #gate layer 1: CCZs
-                            ccz1 = cirq.CCZ(cirq.LineQubit(ghzqub1) , cirq.LineQubit(4), cirq.LineQubit(4*d2))
-                            ccz2 = cirq.CCZ(cirq.LineQubit(ghzqub1+1) ,cirq.LineQubit(2*d2+6) ,cirq.LineQubit(6*d2+2) )
-                            ccz3 = cirq.CCZ(cirq.LineQubit(ghzqub1+2) , cirq.LineQubit(4*d2+8) , cirq.LineQubit(8*d2+4))
+                            ccz1 = ccz_factory(cirq.LineQubit(ghzqub1), cirq.LineQubit(4), cirq.LineQubit(4*d2))
+                            ccz2 = ccz_factory(cirq.LineQubit(ghzqub1+1), cirq.LineQubit(2*d2+6), cirq.LineQubit(6*d2+2))
+                            ccz3 = ccz_factory(cirq.LineQubit(ghzqub1+2), cirq.LineQubit(4*d2+8), cirq.LineQubit(8*d2+4))
                             edited_cirq_rep.append(cirq.Moment([ccz1, ccz2, ccz3]))
                             
                             #add 3q and idle noise
@@ -188,7 +382,7 @@ if __name__ == '__main__':
                         elif cy_moments % 3 == 2: #gate layer 3: 2 diags one off diag
                             csdag1 = sodddiaggate( cirq.LineQubit(6*d2+6)).controlled_by(cirq.LineQubit(ghzqub1)) 
                             cs2 = sevendiaggate( cirq.LineQubit(8*d2+8)).controlled_by(cirq.LineQubit(ghzqub1+1)) 
-                            ccz3last = cirq.CCZ(cirq.LineQubit(ghzqub1+2) , cirq.LineQubit(8) , cirq.LineQubit(8*d2))
+                            ccz3last = ccz_factory(cirq.LineQubit(ghzqub1+2), cirq.LineQubit(8), cirq.LineQubit(8*d2))
                             edited_cirq_rep.append(cirq.Moment([csdag1, cs2, ccz3last]))
 
                             #add 2q & 3q and idle noise
@@ -229,7 +423,15 @@ if __name__ == '__main__':
     if True: #turn off to only sample clifford part
         errloc_sv = {}
         post_sel_shots = np.array([0,0,0])
-        simulator = cirq.Simulator(seed=tasknum)
+        logical_qubit = cirq.LineQubit(4*d2+4)
+        qubit_order = tuple(sorted(edited_cirq_rep.all_qubits()))
+        # If build_ccz_factory returned use_density_sim=True, we are in the
+        # non-unitary CCZ branch above and must propagate a density matrix
+        # through the exact-simulation prefix.
+        if use_density_sim:
+            simulator = cirq.DensityMatrixSimulator(seed=tasknum)
+        else:
+            simulator = cirq.Simulator(seed=tasknum)
 
         for r in range(num_sverr_shots):
 
@@ -241,7 +443,18 @@ if __name__ == '__main__':
 
             if sum(post_sel_msmts) == 0:
                 key = get_pauli_err_from_syndrome(dec_msmts, cirq_conversion=True)
-                bl_logical_sv = [round(elem,5) for elem in result.bloch_vector_of( qubit=cirq.LineQubit(4*d2+4))]
+                # logical_bloch_vector knows how to extract the logical qubit's
+                # reduced state from either a pure state (unitary path) or the
+                # final density matrix (non-unitary contractive_kraus path).
+                bl_logical_sv = [
+                    round(elem, 5)
+                    for elem in logical_bloch_vector(
+                        sim_result=result,
+                        logical_qubit=logical_qubit,
+                        qubit_order=qubit_order,
+                        use_density_sim=use_density_sim,
+                    )
+                ]
                 
                 #update bloch vector
                 if (dec_msmts[10] + dec_msmts[1] + dec_msmts[0]) % 2 == 1: #zstabs from x error
@@ -289,9 +502,18 @@ if __name__ == '__main__':
         overall_fid = 0
         interim_custom_counts  = defaultdict(int)
 
-        task_json_md = {'p': p, 'b':basis, 'noise':'uniform', 'd2':d2, 
-                                    'c':f'Tcirq-handoff-{tag}',
-                                    'ghz_size':ghz_size, 'latter_rounds':latter_rounds}
+        task_json_md = {
+            'p': p,
+            'b': basis,
+            'noise': 'uniform',
+            'd2': d2,
+            'c': f'Tcirq-handoff-{ccz_label_slug}-{tag}',
+            'ghz_size': ghz_size,
+            'latter_rounds': latter_rounds,
+            'ccz_label': ccz_label,
+            'use_custom_ccz': USE_CUSTOM_CCZ,
+            'custom_ccz_mode': CUSTOM_CCZ_MODE if USE_CUSTOM_CCZ else 'ideal',
+        }
         if args.fault_distance_tag is not None:
             task_json_md['f'] = args.fault_distance_tag
         
@@ -310,6 +532,12 @@ if __name__ == '__main__':
 
             print("\nSampling ", num_shots_per_sverr * samples_with_errloc, "shots for", errloc)
 
+            # The non-unitary CCZ does not appear directly in this Stim stage.
+            # Instead, the exact-sim stage above has already converted the
+            # custom gate physics into:
+            # - the distribution over accepted error locations, and
+            # - the logical Bloch vectors attached to those locations.
+            # This stage then resamples the corresponding stabilizer circuits.
             errored_circ = full_circuit(nm=p, 
                          dfinal=d2,
                          ps_on_d3=1,
@@ -389,11 +617,11 @@ if __name__ == '__main__':
                                     custom_counts= Counter(interim_custom_counts),
                                     json_metadata=task_json_md)
                                
-        file_path = f"realcirqhandoffoutputs_p{str(int(1000*p))}_{tag}"
+        file_path = f"realcirqhandoffoutputs_{ccz_label_slug}_p{str(int(1000*p))}_{tag}"
         if not os.path.exists(file_path):
             os.makedirs(file_path)
         try:
-            with open(file_path+f"/TaskStats_b{basis}p{int(1000*p)}_prep{prep}_dfinal{d2}_{tasknum}.json", "w") as f:
+            with open(file_path+f"/TaskStats_b{basis}p{int(1000*p)}_prep{prep}_dfinal{d2}_{ccz_label_slug}_{tasknum}.json", "w") as f:
                 print(finp_res.to_csv_line(), file=f)
         except IOError as e:
             print(f"Error saving file: {e}")
